@@ -1,0 +1,33 @@
+{
+  "code": 200,
+  "data": {
+    "componentPageInfo": {
+      "total": 2,
+      "list": [
+        {
+          "componentCode": "C8734",
+          "componentModelEn": "STM32F103C8T6",
+          "describe": "Synthetic MCU fixture",
+          "componentBrandEn": "STMicroelectronics",
+          "componentSpecificationEn": "LQFP-48",
+          "componentTypeEn": "Microcontrollers",
+          "stockCount": 5000,
+          "componentLibraryType": "expand",
+          "preferredComponentFlag": true,
+          "componentPrices": [
+            {"startNumber": 1, "endNumber": 9, "productPrice": 1.23}
+          ],
+          "urlSuffix": "stm32f103c8t6_C8734",
+          "dataManualUrl": "https://www.lcsc.com/datasheet/C8734.pdf"
+        },
+        {
+          "componentCode": "C2969777",
+          "componentModelEn": "STM32F103C8T6-ALT",
+          "stockCount": 100,
+          "componentLibraryType": "expand",
+          "preferredComponentFlag": false
+        }
+      ]
+    }
+  }
+}

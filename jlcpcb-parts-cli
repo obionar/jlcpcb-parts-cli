@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""jlcpcb-parts-cli — read-only JLCPCB component search, Basic-parts-first.
+
+Single-file CLI, Python 3.10+ standard library only. Copy it anywhere on PATH
+(e.g. ~/.local/bin) and it just works. Unofficial: it calls the same public
+JSON endpoint the jlcpcb.com parts pages use. No login, no cart, no ordering.
+
+Subcommands:
+  search <keyword> [--tier basic|promo|extended|any] [--min-stock N] [-n N]
+  basic  [--category X] [--list-categories] [-n N] [--refresh]
+  info   <C-code or MPN>
+  check  (canary probe for API/schema drift; exit 0/1/2 = PASS/WARN/FAIL)
+  export [-o out.md] [--refresh]
+
+This file is part of jlcpcb-parts-cli. Licensed under GPLv3; see LICENSE
+or <https://www.gnu.org/licenses/gpl-3.0.txt>.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import json
+import math
+import os
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterator
+
+VERSION = "1.1.0"
+
+# ---------------------------------------------------------------------------
+# Client: read-only access to JLCPCB's unofficial parts-search API.
+# Payloads are treated as volatile: missing fields degrade to None, never
+# crash. Schema-level anomalies raise PayloadError with a clear message;
+# soft anomalies are collected in `last_warnings` for callers to surface.
+
+API_URL = (
+    "https://jlcpcb.com/api/overseas-pcb-order/v1/shoppingCart/"
+    "smtGood/selectSmtComponentList"
+)
+
+TIER_BASIC = "basic"
+TIER_PROMO = "promo_extended"
+TIER_EXTENDED = "extended"
+
+_TIER_ORDER = {TIER_BASIC: 0, TIER_PROMO: 1, TIER_EXTENDED: 2}
+
+# Retry policy for transient failures.
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_S = 2.0
+MAX_RESPONSE_BYTES = 20 * 1024 * 1024
+SEARCH_MAX_PAGES = 5
+
+# Warnings from the most recent API call(s). Callers should surface these:
+# they mean the API responded but something looked off (possible drift).
+last_warnings: list[str] = []
+
+
+def _warn(message: str) -> None:
+    if message not in last_warnings:
+        last_warnings.append(message)
+
+
+def take_warnings() -> list[str]:
+    """Return and clear accumulated anomaly warnings."""
+    out, last_warnings[:] = list(last_warnings), []
+    return out
+
+
+class ApiError(RuntimeError):
+    """Raised when the API is unusable. Subclasses tell you why."""
+
+
+class NetworkError(ApiError):
+    """Connectivity / HTTP-level failure — usually transient."""
+
+
+class PayloadError(ApiError):
+    """API responded but the payload is not what we expect — likely schema change."""
+
+
+class HttpError(ApiError):
+    """A non-transient HTTP failure that should not be retried."""
+
+
+def _text(value: Any) -> str | None:
+    """Normalize remote display fields and strip terminal control characters."""
+    if value is None:
+        return None
+    raw = value if isinstance(value, str) else str(value)
+    return "".join(
+        char if ord(char) >= 32 and not 127 <= ord(char) <= 159 else " "
+        for char in raw
+    )
+
+
+def classify_tier(component: dict[str, Any]) -> str:
+    """Map a raw component record to basic / promo_extended / extended."""
+    lib = component.get("componentLibraryType")
+    if lib == "base":
+        return TIER_BASIC
+    if lib == "expand" and component.get("preferredComponentFlag") is True:
+        return TIER_PROMO
+    if lib not in ("base", "expand"):
+        _warn(f"unknown componentLibraryType {lib!r} on "
+              f"{component.get('componentCode')!r}; treated as extended")
+    return TIER_EXTENDED
+
+
+def _first_price(tiers: Any) -> float | None:
+    if not isinstance(tiers, list) or not tiers:
+        return None
+    valid: list[tuple[float, float]] = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            continue
+        try:
+            start = float(tier.get("startNumber", 1))
+            price = float(tier["productPrice"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(start) and math.isfinite(price) and start >= 0 and price >= 0:
+            valid.append((start, price))
+    if not valid:
+        return None
+    return min(valid, key=lambda item: (0 if item[0] <= 1 else 1, item[0]))[1]
+
+
+def normalize(component: dict[str, Any]) -> dict[str, Any]:
+    """Project a raw API record onto the stable public shape."""
+    prices = component.get("componentPrices") or component.get("buyComponentPrices")
+    datasheet = component.get("dataManualUrl")
+    suffix = component.get("urlSuffix")
+    url = f"https://jlcpcb.com/partdetail/{_text(suffix)}" if suffix else None
+    code = component.get("componentCode")
+    # Soft schema checks: fields every real record has carried so far.
+    if not code:
+        _warn("record without componentCode; possibly changed schema")
+    elif not component.get("componentModelEn") and not component.get("componentNameEn"):
+        _warn(f"{code}: no MPN field (componentModelEn/componentNameEn missing)")
+    stock_raw = component.get("stockCount")
+    try:
+        if isinstance(stock_raw, bool):
+            raise ValueError("boolean stock")
+        stock = int(stock_raw) if stock_raw is not None else 0
+    except (TypeError, ValueError):
+        _warn(f"{code or '?'}: non-numeric stockCount {stock_raw!r}")
+        stock = 0
+    if stock < 0:
+        _warn(f"{code or '?'}: negative stockCount {stock}")
+        stock = 0
+    return {
+        "code": _text(code),
+        "mpn": _text(component.get("componentModelEn") or component.get("componentNameEn")),
+        "description": _text(component.get("describe") or component.get("componentName")),
+        "manufacturer": _text(component.get("componentBrandEn")),
+        "package": _text(component.get("componentSpecificationEn")),
+        "category": _text(component.get("componentTypeEn")),
+        "stock": stock,
+        "tier": classify_tier(component),
+        "price_1": _first_price(prices),
+        "url": url,
+        "datasheet": _text(datasheet),
+    }
+
+
+def _request_once(body: dict[str, Any], timeout: float) -> dict[str, Any]:
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        API_URL,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body_bytes = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(body_bytes) > MAX_RESPONSE_BYTES:
+                raise PayloadError("JLCPCB API response is too large.")
+            payload = json.loads(body_bytes)
+    except urllib.error.HTTPError as exc:
+        message = f"JLCPCB API returned HTTP {exc.code}"
+        if exc.code in {408, 429} or 500 <= exc.code <= 599:
+            raise NetworkError(f"{message}; retry later.") from exc
+        raise HttpError(f"{message}; check https://jlcpcb.com/parts.") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise PayloadError(
+            "JLCPCB API returned non-JSON content — endpoint may have moved. "
+            "Check https://jlcpcb.com/parts."
+        ) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise NetworkError(
+            f"JLCPCB API request failed ({exc}). "
+            "Check connectivity, or browse https://jlcpcb.com/parts directly."
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("code") != 200:
+        raise PayloadError(
+            f"JLCPCB API returned unexpected payload "
+            f"(code={payload.get('code') if isinstance(payload, dict) else type(payload).__name__}). "
+            "The API may have changed; check https://jlcpcb.com/parts."
+        )
+    info = payload.get("data")
+    if not isinstance(info, dict) or not isinstance(info.get("componentPageInfo"), dict):
+        raise PayloadError(
+            "JLCPCB API response is missing data.componentPageInfo — "
+            "schema appears changed; check https://jlcpcb.com/parts."
+        )
+    page_info = info["componentPageInfo"]
+    items = page_info.get("list")
+    if items is None:
+        # Known quirk: keyword with zero hits returns list=null. Empty is fine;
+        # anything else suspicious gets flagged by callers via totals.
+        items = []
+    if not isinstance(items, list):
+        raise PayloadError(
+            "JLCPCB API 'list' field is not an array — schema appears changed."
+        )
+    if any(not isinstance(item, dict) for item in items):
+        raise PayloadError(
+            "JLCPCB API 'list' contains a non-object record — schema appears changed."
+        )
+    total_raw = page_info.get("total", 0)
+    try:
+        total = int(total_raw)
+    except (TypeError, ValueError):
+        _warn(f"non-numeric result total {total_raw!r}")
+        total = 0
+    return {"total": max(total, 0), "list": items}
+
+
+def _request(body: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+    """Request with retry/backoff on transient (network) failures only."""
+    last_exc: Exception | None = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return _request_once(body, timeout)
+        except NetworkError as exc:
+            last_exc = exc
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_S * attempt)
+    raise NetworkError(str(last_exc)) from last_exc
+
+
+def search(
+    keyword: str = "",
+    *,
+    base_only: bool = False,
+    basic_only: bool = False,
+    page_size: int = 50,
+    page: int = 1,
+    timeout: float = 30.0,
+) -> tuple[int, list[dict[str, Any]]]:
+    """One API query. Returns (total, list of normalized parts)."""
+    if page_size <= 0 or page <= 0 or timeout <= 0:
+        raise ValueError("page_size, page, and timeout must be greater than zero")
+    body: dict[str, Any] = {
+        "keyword": keyword,
+        "pageSize": min(page_size, 100),
+        "currentPage": page,
+    }
+    if base_only or basic_only:
+        body["componentLibraryType"] = "base"
+        # Required to get the full Basic+Promotional pool (1586); without it the
+        # API currently returns only the plain-Basic subset (351).
+        body["preferredComponentFlag"] = True
+    if basic_only:
+        body["componentProductType"] = 1
+    res = _request(body, timeout=timeout)
+    return res["total"], [normalize(c) for c in res["list"]]
+
+
+def iter_all(
+    keyword: str = "",
+    *,
+    base_only: bool = False,
+    basic_only: bool = False,
+    page_size: int = 100,
+    timeout: float = 30.0,
+) -> Iterator[dict[str, Any]]:
+    """Yield all matching normalized parts, paging automatically."""
+    page = 1
+    while True:
+        total, items = search(
+            keyword,
+            base_only=base_only,
+            basic_only=basic_only,
+            page_size=page_size,
+            page=page,
+            timeout=timeout,
+        )
+        yield from items
+        if page * page_size >= total or not items:
+            return
+        page += 1
+
+
+def sort_key(part: dict[str, Any]):
+    """Default ordering: tier priority, then stock desc."""
+    return (_TIER_ORDER.get(part["tier"], 9), -part["stock"])
+
+
+# Canary check: known-answer probes against live API drift.
+
+# (query, expected_code, expected_tier, min_stock) — verified 2026-08-22.
+CANARIES = [
+    ("STM32F103C8T6", "C8734", TIER_PROMO, 100),
+    ("AMS1117-3.3", "C6186", TIER_BASIC, 1000),
+]
+
+
+def run_canaries(timeout: float = 30.0) -> tuple[str, list[dict[str, Any]]]:
+    """Probe known parts and classify overall health.
+
+    Returns (status, checks) where status is PASS / WARN / FAIL and each check
+    is {name, ok, warn?, error?}.
+    """
+    checks: list[dict[str, Any]] = []
+    for keyword, code, tier, min_stock in CANARIES:
+        name = f"{keyword} → {code}"
+        try:
+            take_warnings()
+            total, parts = search(keyword, page_size=10, timeout=timeout)
+            warnings = take_warnings()
+        except ApiError as exc:
+            checks.append({"name": name, "ok": False, "error": str(exc)})
+            continue
+        match = next((p for p in parts if p["code"] == code), None)
+        if match is None:
+            checks.append({
+                "name": name, "ok": False,
+                "error": f"expected part {code} not in top results "
+                         f"(API returned {total} hits)",
+            })
+            continue
+        problems = list(warnings)
+        if match["tier"] != tier:
+            problems.append(f"tier changed: expected {tier}, got {match['tier']}")
+        if match["stock"] < min_stock:
+            problems.append(f"stock dropped below {min_stock}: {match['stock']}")
+        checks.append({"name": name, "ok": True,
+                       **({"warn": "; ".join(problems)} if problems else {})})
+    if any(not c["ok"] for c in checks):
+        status = "FAIL"
+    elif any(c.get("warn") for c in checks):
+        status = "WARN"
+    else:
+        status = "PASS"
+    return status, checks
+
+
+# ---------------------------------------------------------------------------
+# CLI
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "jlcpcb-parts-cli"
+
+TIER_LABELS = {
+    TIER_BASIC: "BASIC",
+    TIER_PROMO: "PROMO-EXT",
+    TIER_EXTENDED: "EXT",
+}
+TIER_ALIASES = {
+    "basic": TIER_BASIC,
+    "promo": TIER_PROMO,
+    "promo_extended": TIER_PROMO,
+    "extended": TIER_EXTENDED,
+    "any": None,
+}
+
+
+def fmt_price(p: float | None) -> str:
+    return f"${p:.4f}" if p is not None else "-"
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite value greater than zero")
+    return parsed
+
+
+def _show_warnings() -> None:
+    for warning in take_warnings():
+        print(f"warning: {warning}", file=sys.stderr)
+
+
+def print_table(parts: list[dict], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(parts, indent=2, ensure_ascii=False))
+        return
+    if not parts:
+        print("No results.")
+        return
+    print(f"{'TIER':<10}{'CODE':<10}{'MPN':<32}{'PKG':<18}{'STOCK':>10}  {'PRICE@1':<9} DESCRIPTION")
+    for p in parts:
+        desc = (p["description"] or "")[:60]
+        print(f"{TIER_LABELS.get(p['tier'], p['tier']):<10}{p['code'] or '-':<10}"
+              f"{(p['mpn'] or '-')[:31]:<32}{(p['package'] or '-')[:17]:<18}"
+              f"{p['stock']:>10}  {fmt_price(p['price_1']):<9} {desc}")
+    print(f"\n{len(parts)} part(s). Priority: BASIC -> PROMO-EXT -> EXT")
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    tier = TIER_ALIASES[args.tier]
+    base_only = tier in {TIER_BASIC, TIER_PROMO}
+    page_size = min(max(args.limit * 3, 50), 100)
+    parts: list[dict[str, Any]] = []
+    total = 0
+    for page in range(1, SEARCH_MAX_PAGES + 1):
+        total, raw_page_parts = search(
+            args.keyword,
+            base_only=base_only,
+            page_size=page_size,
+            page=page,
+        )
+        page_parts = raw_page_parts
+        if tier:
+            page_parts = [part for part in page_parts if part["tier"] == tier]
+        if args.min_stock:
+            page_parts = [part for part in page_parts if part["stock"] >= args.min_stock]
+        parts.extend(page_parts)
+        if len(parts) >= args.limit or page * page_size >= total or not raw_page_parts:
+            break
+    parts.sort(key=sort_key)
+    parts = parts[: args.limit]
+    if not args.json:
+        print(f"API total: {total}")
+    print_table(parts, args.json)
+    return 0
+
+
+def _valid_cached_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    required = {
+        "code", "mpn", "description", "manufacturer", "package", "category",
+        "stock", "tier", "price_1", "url", "datasheet",
+    }
+    if not required.issubset(part):
+        return False
+    text_fields = {
+        "code", "mpn", "description", "manufacturer", "package", "category",
+        "url", "datasheet",
+    }
+    if any(
+        part[field] is not None and not isinstance(part[field], str)
+        for field in text_fields
+    ):
+        return False
+    if part["tier"] not in _TIER_ORDER or isinstance(part["stock"], bool):
+        return False
+    if not isinstance(part["stock"], int) or part["stock"] < 0:
+        return False
+    price = part["price_1"]
+    return price is None or (
+        isinstance(price, (int, float))
+        and not isinstance(price, bool)
+        and math.isfinite(price)
+        and price >= 0
+    )
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(text)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_basic_cache(refresh: bool) -> tuple[list[dict], str]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = CACHE_DIR / "basic_parts.json"
+    if cache.exists() and not refresh:
+        try:
+            age_h = (time.time() - cache.stat().st_mtime) / 3600
+            if age_h < 24:
+                data = json.loads(cache.read_text())
+                parts = data["parts"]
+                if not isinstance(parts, list) or any(
+                    not _valid_cached_part(part) for part in parts
+                ):
+                    raise ValueError("cache contains invalid parts")
+                return parts, f"cache ({age_h:.1f}h old; --refresh to update)"
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError):
+            # Corrupted or wrong-shape cache: fall through to a refetch.
+            pass
+    parts = list(iter_all(base_only=True))
+    if any(not _valid_cached_part(part) for part in parts):
+        raise PayloadError("JLCPCB normalized part data failed cache validation")
+    _atomic_write_text(
+        cache, json.dumps({"fetched": time.time(), "parts": parts}, allow_nan=False)
+    )
+    return parts, "fresh from API"
+
+
+def cmd_basic(args: argparse.Namespace) -> int:
+    parts, source = load_basic_cache(args.refresh)
+    if args.list_categories:
+        counts = Counter(p["category"] or "-" for p in parts)
+        if not args.json:
+            print(f"Categories in Basic & Promotional pool — {source}")
+            for cat, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+                print(f"{n:>6}  {cat}")
+        else:
+            print(json.dumps(dict(sorted(counts.items(),
+                                         key=lambda kv: -kv[1])),
+                             indent=2, ensure_ascii=False))
+        return 0
+    if args.category:
+        cat = args.category.lower()
+        parts = [p for p in parts if cat in (p["category"] or "").lower()]
+        if not parts and not args.json:
+            print(f"No category matching {args.category!r}. "
+                  "Try: --list-categories")
+    parts.sort(key=sort_key)
+    parts = parts[: args.limit]
+    if not args.json:
+        print(f"Basic & Promotional Extended pool — {source}")
+    print_table(parts, args.json)
+    return 0
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    ident = args.part
+    _, parts = search(ident, page_size=100)
+    normalized_ident = ident.strip().casefold()
+    picks = [
+        p
+        for p in parts
+        if (p["code"] or "").strip().casefold() == normalized_ident
+        or (p["mpn"] or "").strip().casefold() == normalized_ident
+    ]
+    if not picks:
+        if args.json:
+            print("[]")
+        else:
+            print(f"No exact match for {ident!r}.")
+        return 1
+    if args.json:
+        print(json.dumps(picks, indent=2, ensure_ascii=False))
+        return 0
+    for p in picks:
+        print(f"Part:      {p['mpn']}  ({p['code']})")
+        print(f"Tier:      {TIER_LABELS.get(p['tier'], p['tier'])}")
+        print(f"Manufacturer: {p['manufacturer']}   Package: {p['package']}")
+        print(f"Category:  {p['category']}")
+        print(f"Stock:     {p['stock']}   Price@1: {fmt_price(p['price_1'])}")
+        print(f"URL:       {p['url']}")
+        if p["datasheet"]:
+            print(f"Datasheet: {p['datasheet']}")
+        if p["description"]:
+            print(f"Specs:     {p['description'][:200]}")
+        print()
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Canary probe: known parts + schema sanity. Exit 0/1/2 = PASS/WARN/FAIL."""
+    status, checks = run_canaries(timeout=args.timeout)
+    icon = {"PASS": "OK", "WARN": "WARN", "FAIL": "FAIL"}[status]
+    if args.json:
+        print(json.dumps({"status": status, "checks": checks},
+                         indent=2, ensure_ascii=False))
+    else:
+        print(f"JLCPCB API canary: {icon}")
+        for c in checks:
+            line = f"  [{'ok' if c['ok'] else 'BROKEN'}] {c['name']}"
+            print(line)
+            if c.get("warn"):
+                print(f"         warning: {c['warn']}")
+            if c.get("error"):
+                print(f"         error: {c['error']}")
+        if status != "PASS":
+            print("\nAction: verify manually on https://jlcpcb.com/parts; "
+                  "if the site works but this fails, the API/schema drifted — "
+                  "update the client and its fixtures.")
+    return {"PASS": 0, "WARN": 1, "FAIL": 2}[status]
+
+
+def _md(text: str | None) -> str:
+    """Sanitize a field for a Markdown table cell."""
+    return " ".join((text or "-").replace("|", "/").split())
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export the Basic & Promotional pool to a Markdown reference file."""
+    parts, source = load_basic_cache(args.refresh)
+    parts.sort(key=lambda p: ((p["category"] or "").lower(), sort_key(p)))
+    lines = [
+        "# JLCPCB Basic & Promotional Extended Parts — offline reference",
+        "",
+        f"Exported: {time.strftime('%Y-%m-%d %H:%M %Z')} · {len(parts)} parts · {source}.",
+        "",
+        "Regenerate with: `jlcpcb-parts-cli export --refresh > path.md`",
+        "",
+        "Tier legend: BASIC = no extra placement fee · PROMO-EXT = no feeder fee "
+        "in Economic PCBA · EXT shown only for context.",
+        "",
+    ]
+    current_cat = None
+    for p in parts:
+        cat = _md(p["category"] or "Uncategorized")
+        if cat != current_cat:
+            current_cat = cat
+            n = sum(1 for q in parts if (q["category"] or "Uncategorized") == cat)
+            lines += [f"## {cat} ({n})", "",
+                      "| Tier | Code | MPN | Package | Stock | Price@1 | Specs |",
+                      "|---|---|---|---|---|---|---|"]
+        desc = _md(p["description"])
+        lines.append(
+            f"| {TIER_LABELS.get(p['tier'], p['tier'])} "
+            f"| {p['code']} | {_md(p['mpn'])} | {_md(p['package'])} "
+            f"| {p['stock']:,} | {fmt_price(p['price_1'])} | {desc} |"
+        )
+    text = "\n".join(lines) + "\n"
+    out = Path(args.output) if args.output else None
+    if out:
+        _atomic_write_text(out, text)
+        print(f"Wrote {out} ({len(parts)} parts)")
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="jlcpcb-parts-cli",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("search", help="free-text search across all parts")
+    s.add_argument("keyword")
+    s.add_argument("--tier", choices=["basic", "promo", "extended", "any"], default="any")
+    s.add_argument("--min-stock", type=non_negative_int, default=0)
+    s.add_argument("-n", "--limit", type=positive_int, default=15)
+    s.set_defaults(func=cmd_search)
+
+    b = sub.add_parser("basic", help="browse Basic & Promotional Extended pool")
+    b.add_argument("--category", help="substring of category, e.g. 'regulator'")
+    b.add_argument("--list-categories", action="store_true",
+                   help="list categories present in the pool and exit")
+    b.add_argument("-n", "--limit", type=positive_int, default=20)
+    b.add_argument("--refresh", action="store_true")
+    b.set_defaults(func=cmd_basic)
+
+    i = sub.add_parser("info", help="detail for a C-code or MPN")
+    i.add_argument("part")
+    i.set_defaults(func=cmd_info)
+
+    c = sub.add_parser("check", help="canary probe for API/schema drift")
+    c.add_argument("--timeout", type=positive_float, default=30.0)
+    c.set_defaults(func=cmd_check)
+
+    e = sub.add_parser("export", help="dump Basic & Promo pool to Markdown")
+    e.add_argument("-o", "--output", help="output .md path (default: stdout)")
+    e.add_argument("--refresh", action="store_true")
+    e.set_defaults(func=cmd_export)
+
+    args = ap.parse_args(argv)
+    take_warnings()
+    try:
+        result = args.func(args)
+        _show_warnings()
+        return result
+    except BrokenPipeError:
+        return 0
+    except (ApiError, OSError, UnicodeError, ValueError) as exc:
+        _show_warnings()
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

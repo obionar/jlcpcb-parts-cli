@@ -1,0 +1,34 @@
+{
+  "code": 200,
+  "data": {
+    "componentPageInfo": {
+      "total": 2,
+      "list": [
+        {
+          "componentCode": "C1002",
+          "componentModelEn": "GZ1608D601TF",
+          "describe": "Synthetic ferrite bead fixture",
+          "componentBrandEn": "Sunlord",
+          "componentSpecificationEn": "0603",
+          "componentTypeEn": "Ferrite Beads",
+          "stockCount": 12345,
+          "componentLibraryType": "base",
+          "preferredComponentFlag": false,
+          "componentPrices": [
+            {"startNumber": 200, "endNumber": 599, "productPrice": 0.0154},
+            {"startNumber": 1, "endNumber": 199, "productPrice": 0.0177}
+          ],
+          "urlSuffix": "gz1608d601tf_C1002",
+          "dataManualUrl": "https://example.invalid/c1002.pdf"
+        },
+        {
+          "componentCode": "C1035",
+          "componentModelEn": "SYNTHETIC-1035",
+          "stockCount": 500,
+          "componentLibraryType": "base",
+          "preferredComponentFlag": false
+        }
+      ]
+    }
+  }
+}
