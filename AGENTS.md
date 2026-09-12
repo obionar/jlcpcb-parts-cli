@@ -71,17 +71,14 @@ jlcpcb-parts-cli export [-o out.md] [--refresh]
 
 ## Using as a skill
 
-Users can install this tool into their agent by pasting the repository URL
-into the chat (Hermes, OpenClaw, Claude Code, …) with a request like
-"install this as a skill: copy the script to ~/.local/bin (chmod +x), read
-AGENTS.md and follow it". When that happens, the agent should:
-
-1. Copy `jlcpcb-parts-cli` to `~/.local/bin/` and `chmod +x` it.
-2. Read this file and create a skill whose SKILL.md says: "Use when selecting
-   components for JLCPCB Assembly. Run `jlcpcb-parts-cli --json search <MPN>`,
-   prefer tier basic > promo_extended > extended. `code` is the JLCPCB part
-   number for the BOM." plus the command contract above.
-3. No API keys, no configuration, no environment variables needed.
+This repository ships a ready-made, agent-neutral skill at
+`skill/jlcpcb-parts-cli/SKILL.md` (AgentSkills-compatible SKILL.md with YAML
+frontmatter — the same format Claude Code, OpenCode, OpenClaw, and Hermes
+load). `./install.sh` installs ONLY the CLI. Skills are never sprayed into
+every agent on the machine: when a user asks THIS agent to integrate the
+tool, the agent runs
+`./install.sh --skill-dir <its-own-skills-dir>` — one explicit target,
+chosen by the agent that owns it, at the moment its user asks.
 
 ## Maintenance
 

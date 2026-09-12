@@ -26,6 +26,18 @@ Python 3.10+ standard library only — no pip, no venv, no dependencies.
 
 ```bash
 git clone https://github.com/obionar/jlcpcb-parts-cli.git
+cd jlcpcb-parts-cli && ./install.sh
+```
+
+This installs the CLI to `~/.local/bin`. To also install the bundled
+agent skill (`skill/jlcpcb-parts-cli/SKILL.md`, AgentSkills-compatible),
+pass your agent's skills dir explicitly:
+`./install.sh --skill-dir ~/.claude/skills` — skills are never
+auto-installed into every agent found; each agent integrates the skill
+itself when you ask it to. `--uninstall` removes both. Manual CLI-only
+alternative:
+
+```bash
 cp jlcpcb-parts-cli/jlcpcb-parts-cli ~/.local/bin/
 chmod +x ~/.local/bin/jlcpcb-parts-cli
 ```
