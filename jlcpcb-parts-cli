@@ -55,6 +55,7 @@ MAX_ATTEMPTS = 3
 RETRY_BACKOFF_S = 2.0
 MAX_RESPONSE_BYTES = 20 * 1024 * 1024
 SEARCH_MAX_PAGES = 5
+POOL_MAX_PAGES = 100
 
 # Warnings from the most recent API call(s). Callers should surface these:
 # they mean the API responded but something looked off (possible drift).
@@ -148,7 +149,7 @@ def normalize(component: dict[str, Any]) -> dict[str, Any]:
         if isinstance(stock_raw, bool):
             raise ValueError("boolean stock")
         stock = int(stock_raw) if stock_raw is not None else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _warn(f"{code or '?'}: non-numeric stockCount {stock_raw!r}")
         stock = 0
     if stock < 0:
@@ -227,7 +228,7 @@ def _request_once(body: dict[str, Any], timeout: float) -> dict[str, Any]:
     total_raw = page_info.get("total", 0)
     try:
         total = int(total_raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         _warn(f"non-numeric result total {total_raw!r}")
         total = 0
     return {"total": max(total, 0), "list": items}
@@ -296,6 +297,10 @@ def iter_all(
         yield from items
         if page * page_size >= total or not items:
             return
+        if page >= POOL_MAX_PAGES:
+            raise PayloadError(
+                f"JLCPCB full-pool pagination exceeded {POOL_MAX_PAGES} pages"
+            )
         page += 1
 
 
@@ -515,6 +520,8 @@ def load_basic_cache(refresh: bool) -> tuple[list[dict], str]:
             # Corrupted or wrong-shape cache: fall through to a refetch.
             pass
     parts = list(iter_all(base_only=True))
+    if not parts:
+        raise PayloadError("JLCPCB returned an empty parts pool; preserving cache")
     if any(not _valid_cached_part(part) for part in parts):
         raise PayloadError("JLCPCB normalized part data failed cache validation")
     _atomic_write_text(
@@ -552,14 +559,19 @@ def cmd_basic(args: argparse.Namespace) -> int:
 
 def cmd_info(args: argparse.Namespace) -> int:
     ident = args.part
-    _, parts = search(ident, page_size=100)
     normalized_ident = ident.strip().casefold()
-    picks = [
-        p
-        for p in parts
-        if (p["code"] or "").strip().casefold() == normalized_ident
-        or (p["mpn"] or "").strip().casefold() == normalized_ident
-    ]
+    for page in range(1, SEARCH_MAX_PAGES + 1):
+        total, parts = search(ident, page_size=100, page=page)
+        picks = [
+            p
+            for p in parts
+            if (p["code"] or "").strip().casefold() == normalized_ident
+            or (p["mpn"] or "").strip().casefold() == normalized_ident
+        ]
+        if picks or page * 100 >= total or not parts:
+            break
+    else:
+        raise PayloadError("Exact lookup exceeded five pages; availability is unknown")
     if not picks:
         if args.json:
             print("[]")
@@ -632,7 +644,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         cat = _md(p["category"] or "Uncategorized")
         if cat != current_cat:
             current_cat = cat
-            n = sum(1 for q in parts if (q["category"] or "Uncategorized") == cat)
+            n = sum(1 for q in parts if _md(q["category"] or "Uncategorized") == cat)
             lines += [f"## {cat} ({n})", "",
                       "| Tier | Code | MPN | Package | Stock | Price@1 | Specs |",
                       "|---|---|---|---|---|---|---|"]

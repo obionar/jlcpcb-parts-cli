@@ -63,8 +63,10 @@ jlcpcb-parts-cli export [-o out.md] [--refresh]
   retail stock. For hand-buying use the companion `lcsc-cli`.
 - Ambiguous keywords work, but exact MPNs give exact hits; prefer full MPNs.
 - `info` accepts either a C-code (`C6186`) or an MPN (`AMS1117-3.3`).
-- `search` reads up to five API pages; narrow very broad keywords if that cap
-  is hit.
+- `search` and exact `info` read up to five API pages; exceeding the `info`
+  cap is an error (availability unknown), not a false no-match.
+- Full-pool `basic`/`export` pagination stops with an error after 100 pages;
+  an empty API pool does not overwrite an existing cache.
 
 ## Safety boundaries (hard rules)
 
@@ -84,23 +86,24 @@ Before relying on the command contract, run `jlcpcb-parts-cli --version`:
 
 - **Match** → proceed.
 - **Mismatch** → skill and tool have drifted apart; the command contract
-  above may be wrong. Refresh both from the source before continuing:
-  ```bash
-  git -C <your-clone-dir> pull && ./install.sh
-  # no clone yet? git clone https://github.com/obionar/jlcpcb-parts-cli.git && cd jlcpcb-parts-cli && ./install.sh
-  ```
-  Then re-run `--version` and reload this skill if it changed. Do not guess
+  above may be wrong. Pull the source clone, copy its root `jlcpcb-parts-cli`
+  over the installed executable, and copy `skill/jlcpcb-parts-cli/SKILL.md`
+  over this skill. Then re-run `--version` and reload this skill. Do not guess
   how an unknown version behaves — old flags may be gone or renamed.
 
-## Install
+## Install or update
 
-```bash
-git clone https://github.com/obionar/jlcpcb-parts-cli.git
-cd jlcpcb-parts-cli && ./install.sh --skill-dir ~/.your-agent/skills
-```
+When the user asks you to download and integrate the tool, clone
+`https://github.com/obionar/jlcpcb-parts-cli.git` and copy these two artifacts:
 
-`./install.sh` alone installs only the CLI; the skill goes into ONE
-explicitly passed skills dir — the agent integrating this tool passes its
-own (e.g. `~/.claude/skills`, `~/.hermes/skills`).
+- `jlcpcb-parts-cli` → the user's chosen bin directory, default
+  `~/.local/bin/jlcpcb-parts-cli`; make it executable.
+- `skill/jlcpcb-parts-cli/SKILL.md` →
+  `~/.agents/skills/jlcpcb-parts-cli/SKILL.md`; create the directory first.
+
+All functional code is in the single root executable. Do not duplicate it into
+the skill, auto-detect agents, or write into other agent skill directories.
+Repeat the same copies to update. Verify with
+`<chosen-bin>/jlcpcb-parts-cli --version`.
 
 No API keys, no configuration, no environment variables needed.

@@ -126,6 +126,15 @@ class TestNormalize(unittest.TestCase):
             any("stockCount" in warning for warning in client.take_warnings())
         )
 
+    def test_non_finite_stock_degrades_to_zero(self):
+        client.take_warnings()
+        part = client.normalize({"componentCode": "C8", "stockCount": 1e400})
+
+        self.assertEqual(part["stock"], 0)
+        self.assertTrue(
+            any("stockCount" in warning for warning in client.take_warnings())
+        )
+
     def test_string_false_is_not_a_truthy_promo_flag(self):
         part = client.normalize(
             {
@@ -181,6 +190,28 @@ class TestSearch(unittest.TestCase):
             self.assertRaisesRegex(client.PayloadError, "non-object"),
         ):
             client._request_once({}, 1)
+
+    def test_non_finite_total_degrades_to_zero(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = (
+            b'{"code":200,"data":{"componentPageInfo":{"total":1e400,"list":[]}}}'
+        )
+        with mock.patch.object(client.urllib.request, "urlopen", return_value=response):
+            result = client._request_once({}, 1)
+
+        self.assertEqual(result["total"], 0)
+
+    def test_full_pool_pagination_stops_at_safety_cap(self):
+        with mock.patch.object(
+            client, "search", return_value=(10**18, [normalized_part()])
+        ) as search:
+            iterator = client.iter_all()
+            with self.assertRaisesRegex(client.PayloadError, "100"):
+                for _ in range(101):
+                    next(iterator)
+
+        self.assertEqual(search.call_count, 100)
 
 
 class TestSortKey(unittest.TestCase):
@@ -261,6 +292,7 @@ class TestErrorHandling(unittest.TestCase):
 
     def test_non_retryable_http_error_is_not_retried(self):
         error = client.urllib.error.HTTPError(client.API_URL, 404, "missing", {}, None)
+        self.addCleanup(error.close)
         with (
             mock.patch.object(
                 client.urllib.request, "urlopen", side_effect=error
@@ -338,6 +370,33 @@ class TestCommands(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertEqual(json.loads(output.getvalue()), [])
+
+    def test_info_reads_later_pages_for_exact_match(self):
+        fuzzy = normalized_part(mpn="ABC-123")
+        exact = normalized_part(code="C9", mpn="TARGET-MPN")
+        with (
+            mock.patch.object(
+                client, "search", side_effect=[(101, [fuzzy]), (101, [exact])]
+            ) as search,
+            mock.patch("sys.stdout", new_callable=StringIO) as output,
+        ):
+            result = client.main(["--json", "info", "TARGET-MPN"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())[0]["code"], "C9")
+        self.assertEqual(search.call_count, 2)
+
+    def test_info_stops_immediately_when_exact_match_is_found(self):
+        exact = normalized_part(code="C9", mpn="TARGET-MPN")
+        with (
+            mock.patch.object(client, "search", return_value=(1000, [exact])) as search,
+            mock.patch("sys.stdout", new_callable=StringIO) as output,
+        ):
+            result = client.main(["--json", "info", "TARGET-MPN"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue())[0]["code"], "C9")
+        self.assertEqual(search.call_count, 1)
 
     def test_regular_command_surfaces_and_clears_warnings(self):
         raw = {"componentCode": "C9", "componentLibraryType": "surprise"}
@@ -435,10 +494,38 @@ class TestBasicCache(unittest.TestCase):
         self.assertEqual(parts[0]["code"], "C4")
         fetch.assert_called_once()
 
+    def test_empty_refresh_preserves_existing_cache(self):
+        import os
+
+        cache = client.CACHE_DIR / "basic_parts.json"
+        old_parts = [normalized_part(code="C6186")]
+        cache.write_text(json.dumps({"fetched": 1, "parts": old_parts}))
+        stale = time.time() - 25 * 3600
+        os.utime(cache, (stale, stale))
+
+        with (
+            mock.patch.object(client, "iter_all", return_value=iter(())),
+            self.assertRaisesRegex(client.PayloadError, "empty"),
+        ):
+            client.load_basic_cache(refresh=False)
+
+        self.assertEqual(json.loads(cache.read_text())["parts"], old_parts)
+
 
 class TestMarkdown(unittest.TestCase):
     def test_table_cells_are_single_line_and_pipe_safe(self):
         self.assertEqual(client._md("x\ny|z"), "x y/z")
+
+    def test_export_counts_sanitized_category(self):
+        part = normalized_part(category="A|B")
+        with (
+            mock.patch.object(client, "load_basic_cache", return_value=([part], "test")),
+            mock.patch("sys.stdout", new_callable=StringIO) as output,
+        ):
+            result = client.main(["export"])
+
+        self.assertEqual(result, 0)
+        self.assertIn("## A/B (1)", output.getvalue())
 
 
 if __name__ == "__main__":

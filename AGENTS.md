@@ -69,16 +69,23 @@ jlcpcb-parts-cli export [-o out.md] [--refresh]
 - If `check` fails, the endpoint moved or the schema changed: report it, then
   verify against https://jlcpcb.com/parts manually before code changes.
 
-## Using as a skill
+## Integrating with an agent
 
-This repository ships a ready-made, agent-neutral skill at
-`skill/jlcpcb-parts-cli/SKILL.md` (AgentSkills-compatible SKILL.md with YAML
-frontmatter — the same format Claude Code, OpenCode, OpenClaw, and Hermes
-load). `./install.sh` installs ONLY the CLI. Skills are never sprayed into
-every agent on the machine: when a user asks THIS agent to integrate the
-tool, the agent runs
-`./install.sh --skill-dir <its-own-skills-dir>` — one explicit target,
-chosen by the agent that owns it, at the moment its user asks.
+The root `jlcpcb-parts-cli` is the only functional code. The bundled skill at
+`skill/jlcpcb-parts-cli/SKILL.md` contains documentation only. When the user
+asks THIS agent to download and integrate the tool:
+
+1. Clone `https://github.com/obionar/jlcpcb-parts-cli.git` into a source or
+   temporary directory.
+2. Copy `jlcpcb-parts-cli` to the user's chosen bin directory, defaulting to
+   `~/.local/bin/jlcpcb-parts-cli`, and make it executable.
+3. Copy only `skill/jlcpcb-parts-cli/SKILL.md` to
+   `~/.agents/skills/jlcpcb-parts-cli/SKILL.md`, creating that directory first.
+   Use a different skill destination only when the user explicitly requests one.
+4. Verify the copied executable with `<chosen-bin>/jlcpcb-parts-cli --version`.
+
+Do not use `sudo`, auto-detect agents, or write into other agent skill
+directories. Repeat the same copies to update an existing installation.
 
 ## Maintenance
 
