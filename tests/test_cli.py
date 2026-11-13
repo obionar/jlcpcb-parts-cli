@@ -519,7 +519,9 @@ class TestMarkdown(unittest.TestCase):
     def test_export_counts_sanitized_category(self):
         part = normalized_part(category="A|B")
         with (
-            mock.patch.object(client, "load_basic_cache", return_value=([part], "test")),
+            mock.patch.object(
+                client, "load_basic_cache", return_value=([part], "test")
+            ),
             mock.patch("sys.stdout", new_callable=StringIO) as output,
         ):
             result = client.main(["export"])
